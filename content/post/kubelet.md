@@ -1,6 +1,6 @@
 +++
 keywords = ["k8s", 'kubelet']
-title = "kubelet源码解析(上)"
+title = "kubelet源码解析-启动流程与POD处理(上)"
 categories = ["k8s"]
 disqusIdentifier = "k8s_kubelet_source"
 comments = true
@@ -22,6 +22,20 @@ showDate = true
 - 容器健康检查：通过ReadinessProbe、LivenessProbe两种探针检查容器健康状态
 - 资源监控：通过 cAdvisor 获取其所在节点及容器的监控数据
 
+### kubelet组件模块
+
+![kubelet_mods](/images/kubelet_mods.png)
+
+kubelet组件模块如上图所示，下面先对几个比较重要的几个模块进行简单说明：
+
+- Pleg(Pod Lifecycle Event Generator) 是kubelet 的核心模块，PLEG周期性调用container runtime获取本节点containers/sandboxes的信息(像docker ps)，并与自身维护的pods cache信息进行对比，生成对应的 PodLifecycleEvent并发送到plegCh中，在kubelet syncLoop中对plegCh进行消费处理，最终达到用户的期望状态，相关设计可以看[这里](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/node/pod-lifecycle-event-generator.md)
+- podManager提供存储、访问Pod信息的接口，维护static pod和mirror pod的映射关系
+- containerManager 管理容器的各种资源，比如 CGroups、QoS、cpuset、device 等
+- KubeletGenericRuntimeManager是容器运行时的管理者，负责于 CRI 交互，完成容器和镜像的管理；关于client/server container runtime 设计可以看[这里](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/node/runtime-client-server.md)
+- statusManager负责维护pod状态信息并负责同步到apiserver
+- probeManager负责探测pod状态，依赖statusManager、statusManager、livenessManager、startupManager
+- cAdvisor是google开源的容器监控工具，集成在kubelet中，收集节点与容器的监控信息，对外提供查询接口
+- volumeManager 管理容器的存储卷，比如格式化资盘、挂载到 Node 本地、最后再将挂载路径传给容器
 
 ### 深入kubelet工作原理
 
@@ -33,19 +47,472 @@ showDate = true
 
 kubelet代码(版本1.19)主要位于cmd/kubelet与pkg/kubelet下，首先看下kubelet启动流程与初始化
 
-```
-// kubelet依赖cobra命令行库，创建kubelet command并执行
-cmd/kubelet/kubelet.go:34          func main()
-// 处理flags、configfile验证、初始化kubletServer/kubeletDeps(依赖注入)、信号处理ctx，调用run
-cmd/kubelet/app/server.go:113      func NewKubeletCommand() *cobra.Command
-// client(kube\event\heartbeat)、auth、cgroup、cadvisor、containerManager、runtime初始化(dockershim...)、healthz监听，调用RunKubelet
-cmd/kubelet/app/server.go:472      func run
-// 创建Kubelet关键结构体，执行Kubelet Run进入主循环，运行kubelet server、只读端口等
-cmd/kubelet/app/server.go:1071     func RunKubelet
+![kubelet_up](/images/kubelet_up.png)
 
-// 先看下NewMainKubelet创建初始化Kubelet关键结构体函数
-cmd/kubelet/kubelet.go:333
+1 cmd/kubelet/kubelet.go:34
+
+```
+func main() {
+	rand.Seed(time.Now().UnixNano())
+
+	command := app.NewKubeletCommand()
+	logs.InitLogs()
+	defer logs.FlushLogs()
+
+	if err := command.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+```
+
+**main**  入口函数，kubelet依赖cobra命令行库，创建kubelet command并执行
+
+2  cmd/kubelet/app/server.go:113
+
+```
+func NewKubeletCommand() *cobra.Command {
+	cleanFlagSet := pflag.NewFlagSet(componentKubelet, pflag.ContinueOnError)
+	cleanFlagSet.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
+	// kubelet包含两部分配置
+	// kubeletFlags是不能在运行时修改的配置或不在node间共享的配置
+	// kubeletConfig可以在node间共享的配置，可以动态配置
+	kubeletFlags := options.NewKubeletFlags()
+	kubeletConfig, err := options.NewKubeletConfiguration()
+	if err != nil {
+		klog.Fatal(err)
+	}
+
+	cmd := &cobra.Command{
+		Use: componentKubelet,
+		...
+		Run: func(cmd *cobra.Command, args []string) {
+			// 命令行参数解析
+			if err := cleanFlagSet.Parse(args); err != nil {
+				cmd.Usage()
+				klog.Fatal(err)
+			}
+			...
+			// 验证参数
+			if err := options.ValidateKubeletFlags(kubeletFlags); err != nil {
+				klog.Fatal(err)
+			}
+			// 加载kubelet配置文件
+			if configFile := kubeletFlags.KubeletConfigFile; len(configFile) > 0 {
+				kubeletConfig, err = loadConfigFile(configFile)
+				...
+			}
+			// 验证配置文件
+			if err := kubeletconfigvalidation.ValidateKubeletConfiguration(kubeletConfig); err != nil {
+				klog.Fatal(err)
+			}
+			// 构建KubeletServer
+			kubeletServer := &options.KubeletServer{
+				KubeletFlags:         *kubeletFlags,
+				KubeletConfiguration: *kubeletConfig,
+			}
+			// 创建KubeletDeps
+			kubeletDeps, err := UnsecuredDependencies(kubeletServer, utilfeature.DefaultFeatureGate)
+			if err != nil {
+				klog.Fatal(err)
+			}
+			// 设置信号处理
+			ctx := genericapiserver.SetupSignalContext()
+			// 执行Run
+			klog.V(5).Infof("KubeletConfiguration: %#v", kubeletServer.KubeletConfiguration)
+			if err := Run(ctx, kubeletServer, kubeletDeps, utilfeature.DefaultFeatureGate); err != nil {
+				klog.Fatal(err)
+			}
+		},
+	}
+    ......
+    return cmd
+}
+```
+
+**NewKubeletCommand**创建kubelet cobra.Command结构体，Run函数主要解析参数、配置文件，构建KubeletServer、KubeletDependencies，设置信号处理函数，最后执行Run
+
+3  cmd/kubelet/app/server.go:472
+
+```
+func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Dependencies, featureGate featuregate.FeatureGate) (err error) {
+    ......
+	// 验证KubeletServer中flags、configs参数
+	if err := options.ValidateKubeletServer(s); err != nil {
+		return err
+	}
+	// 获得Kubelet Lock File，feature
+	if s.ExitOnLockContention && s.LockFilePath == "" {
+		return errors.New("cannot exit on lock file contention: no lock file specified")
+	}
+	done := make(chan struct{})
+	if s.LockFilePath != "" {
+		klog.Infof("acquiring file lock on %q", s.LockFilePath)
+		if err := flock.Acquire(s.LockFilePath); err != nil {
+			return fmt.Errorf("unable to acquire file lock on %q: %v", s.LockFilePath, err)
+		}
+		if s.ExitOnLockContention {
+			klog.Infof("watching for inotify events for: %v", s.LockFilePath)
+			if err := watchForLockfileContention(s.LockFilePath, done); err != nil {
+				return err
+			}
+		}
+	}
+	// 将当前配置注册到http server /configz URL
+	err = initConfigz(&s.KubeletConfiguration)
+	if err != nil {
+		klog.Errorf("unable to register KubeletConfiguration with configz, error: %v", err)
+	}
+	......
+	// 如果是standalone mode将所有client设置为nil
+	switch {
+	case standaloneMode:
+		kubeDeps.KubeClient = nil
+		kubeDeps.EventClient = nil
+		kubeDeps.HeartbeatClient = nil
+		klog.Warningf("standalone mode, no API client")
+    // 根据配置创建各个clientset
+	case kubeDeps.KubeClient == nil, kubeDeps.EventClient == nil, kubeDeps.HeartbeatClient == nil:
+		clientConfig, closeAllConns, err := buildKubeletClientConfig(ctx, s, nodeName)
+		if err != nil {
+			return err
+		}
+		if closeAllConns == nil {
+			return errors.New("closeAllConns must be a valid function other than nil")
+		}
+		kubeDeps.OnHeartbeatFailure = closeAllConns
+
+		kubeDeps.KubeClient, err = clientset.NewForConfig(clientConfig)
+		if err != nil {
+			return fmt.Errorf("failed to initialize kubelet client: %v", err)
+		}
+
+		// make a separate client for events
+		eventClientConfig := *clientConfig
+		eventClientConfig.QPS = float32(s.EventRecordQPS)
+		eventClientConfig.Burst = int(s.EventBurst)
+		kubeDeps.EventClient, err = v1core.NewForConfig(&eventClientConfig)
+		if err != nil {
+			return fmt.Errorf("failed to initialize kubelet event client: %v", err)
+		}
+
+		// make a separate client for heartbeat with throttling disabled and a timeout attached
+		heartbeatClientConfig := *clientConfig
+		heartbeatClientConfig.Timeout = s.KubeletConfiguration.NodeStatusUpdateFrequency.Duration
+		// The timeout is the minimum of the lease duration and status update frequency
+		leaseTimeout := time.Duration(s.KubeletConfiguration.NodeLeaseDurationSeconds) * time.Second
+		if heartbeatClientConfig.Timeout > leaseTimeout {
+			heartbeatClientConfig.Timeout = leaseTimeout
+		}
+
+		heartbeatClientConfig.QPS = float32(-1)
+		kubeDeps.HeartbeatClient, err = clientset.NewForConfig(&heartbeatClientConfig)
+		if err != nil {
+			return fmt.Errorf("failed to initialize kubelet heartbeat client: %v", err)
+		}
+	}
+    // 初始化auth
+	if kubeDeps.Auth == nil {
+		auth, runAuthenticatorCAReload, err := BuildAuth(nodeName, kubeDeps.KubeClient, s.KubeletConfiguration)
+		if err != nil {
+			return err
+		}
+		kubeDeps.Auth = auth
+		runAuthenticatorCAReload(ctx.Done())
+	}
+    // 设置cgroupRoot
+	var cgroupRoots []string
+	nodeAllocatableRoot := cm.NodeAllocatableRoot(s.CgroupRoot, s.CgroupsPerQOS, s.CgroupDriver)
+	cgroupRoots = append(cgroupRoots, nodeAllocatableRoot)
+	kubeletCgroup, err := cm.GetKubeletContainer(s.KubeletCgroups)
+	if err != nil {
+		klog.Warningf("failed to get the kubelet's cgroup: %v.  Kubelet system container metrics may be missing.", err)
+	} else if kubeletCgroup != "" {
+		cgroupRoots = append(cgroupRoots, kubeletCgroup)
+	}
+
+	runtimeCgroup, err := cm.GetRuntimeContainer(s.ContainerRuntime, s.RuntimeCgroups)
+	if err != nil {
+		klog.Warningf("failed to get the container runtime's cgroup: %v. Runtime system container metrics may be missing.", err)
+	} else if runtimeCgroup != "" {
+		// RuntimeCgroups is optional, so ignore if it isn't specified
+		cgroupRoots = append(cgroupRoots, runtimeCgroup)
+	}
+
+	if s.SystemCgroups != "" {
+		// SystemCgroups is optional, so ignore if it isn't specified
+		cgroupRoots = append(cgroupRoots, s.SystemCgroups)
+	}
+    // 初始化cAdvisor
+	if kubeDeps.CAdvisorInterface == nil {
+		imageFsInfoProvider := cadvisor.NewImageFsInfoProvider(s.ContainerRuntime, s.RemoteRuntimeEndpoint)
+		kubeDeps.CAdvisorInterface, err = cadvisor.New(imageFsInfoProvider, s.RootDirectory, cgroupRoots, cadvisor.UsingLegacyCadvisorStats(s.ContainerRuntime, s.RemoteRuntimeEndpoint))
+		if err != nil {
+			return err
+		}
+	}
+
+	// Setup event recorder if required.
+	makeEventRecorder(kubeDeps, nodeName)
+    // 初始化containerManager
+	if kubeDeps.ContainerManager == nil {
+		if s.CgroupsPerQOS && s.CgroupRoot == "" {
+			klog.Info("--cgroups-per-qos enabled, but --cgroup-root was not specified.  defaulting to /")
+			s.CgroupRoot = "/"
+		}
+       // 计算节点capacity
+		var reservedSystemCPUs cpuset.CPUSet
+		var errParse error
+		if s.ReservedSystemCPUs != "" {
+			reservedSystemCPUs, errParse = cpuset.Parse(s.ReservedSystemCPUs)
+			if errParse != nil {
+				// invalid cpu list is provided, set reservedSystemCPUs to empty, so it won't overwrite kubeReserved/systemReserved
+				klog.Infof("Invalid ReservedSystemCPUs \"%s\"", s.ReservedSystemCPUs)
+				return errParse
+			}
+			// is it safe do use CAdvisor here ??
+			machineInfo, err := kubeDeps.CAdvisorInterface.MachineInfo()
+			if err != nil {
+				// if can't use CAdvisor here, fall back to non-explicit cpu list behavor
+				klog.Warning("Failed to get MachineInfo, set reservedSystemCPUs to empty")
+				reservedSystemCPUs = cpuset.NewCPUSet()
+			} else {
+				reservedList := reservedSystemCPUs.ToSlice()
+				first := reservedList[0]
+				last := reservedList[len(reservedList)-1]
+				if first < 0 || last >= machineInfo.NumCores {
+					// the specified cpuset is outside of the range of what the machine has
+					klog.Infof("Invalid cpuset specified by --reserved-cpus")
+					return fmt.Errorf("Invalid cpuset %q specified by --reserved-cpus", s.ReservedSystemCPUs)
+				}
+			}
+		} else {
+			reservedSystemCPUs = cpuset.NewCPUSet()
+		}
+
+		if reservedSystemCPUs.Size() > 0 {
+			// at cmd option valication phase it is tested either --system-reserved-cgroup or --kube-reserved-cgroup is specified, so overwrite should be ok
+			klog.Infof("Option --reserved-cpus is specified, it will overwrite the cpu setting in KubeReserved=\"%v\", SystemReserved=\"%v\".", s.KubeReserved, s.SystemReserved)
+			if s.KubeReserved != nil {
+				delete(s.KubeReserved, "cpu")
+			}
+			if s.SystemReserved == nil {
+				s.SystemReserved = make(map[string]string)
+			}
+			s.SystemReserved["cpu"] = strconv.Itoa(reservedSystemCPUs.Size())
+			klog.Infof("After cpu setting is overwritten, KubeReserved=\"%v\", SystemReserved=\"%v\"", s.KubeReserved, s.SystemReserved)
+		}
+		kubeReserved, err := parseResourceList(s.KubeReserved)
+		if err != nil {
+			return err
+		}
+		systemReserved, err := parseResourceList(s.SystemReserved)
+		if err != nil {
+			return err
+		}
+		var hardEvictionThresholds []evictionapi.Threshold
+		// If the user requested to ignore eviction thresholds, then do not set valid values for hardEvictionThresholds here.
+		if !s.ExperimentalNodeAllocatableIgnoreEvictionThreshold {
+			hardEvictionThresholds, err = eviction.ParseThresholdConfig([]string{}, s.EvictionHard, nil, nil, nil)
+			if err != nil {
+				return err
+			}
+		}
+		experimentalQOSReserved, err := cm.ParseQOSReserved(s.QOSReserved)
+		if err != nil {
+			return err
+		}
+
+		devicePluginEnabled := utilfeature.DefaultFeatureGate.Enabled(features.DevicePlugins)
+       // 创建ContainerManager，其中包含cgroupManager、QosContainerManager、cpuManager等
+		kubeDeps.ContainerManager, err = cm.NewContainerManager(
+			kubeDeps.Mounter,
+			kubeDeps.CAdvisorInterface,
+			cm.NodeConfig{
+				RuntimeCgroupsName:    s.RuntimeCgroups,
+				SystemCgroupsName:     s.SystemCgroups,
+				KubeletCgroupsName:    s.KubeletCgroups,
+				ContainerRuntime:      s.ContainerRuntime,
+				CgroupsPerQOS:         s.CgroupsPerQOS,
+				CgroupRoot:            s.CgroupRoot,
+				CgroupDriver:          s.CgroupDriver,
+				KubeletRootDir:        s.RootDirectory,
+				ProtectKernelDefaults: s.ProtectKernelDefaults,
+				NodeAllocatableConfig: cm.NodeAllocatableConfig{
+					KubeReservedCgroupName:   s.KubeReservedCgroup,
+					SystemReservedCgroupName: s.SystemReservedCgroup,
+					EnforceNodeAllocatable:   sets.NewString(s.EnforceNodeAllocatable...),
+					KubeReserved:             kubeReserved,
+					SystemReserved:           systemReserved,
+					ReservedSystemCPUs:       reservedSystemCPUs,
+					HardEvictionThresholds:   hardEvictionThresholds,
+				},
+				QOSReserved:                           *experimentalQOSReserved,
+				ExperimentalCPUManagerPolicy:          s.CPUManagerPolicy,
+				ExperimentalCPUManagerReconcilePeriod: s.CPUManagerReconcilePeriod.Duration,
+				ExperimentalPodPidsLimit:              s.PodPidsLimit,
+				EnforceCPULimits:                      s.CPUCFSQuota,
+				CPUCFSQuotaPeriod:                     s.CPUCFSQuotaPeriod.Duration,
+				ExperimentalTopologyManagerPolicy:     s.TopologyManagerPolicy,
+			},
+			s.FailSwapOn,
+			devicePluginEnabled,
+			kubeDeps.Recorder)
+
+		if err != nil {
+			return err
+		}
+	}
+    // 检查是否root启动
+	if err := checkPermissions(); err != nil {
+		klog.Error(err)
+	}
+
+	utilruntime.ReallyCrash = s.ReallyCrashForTesting
+
+	// kubelet oom分数设置
+	oomAdjuster := kubeDeps.OOMAdjuster
+	if err := oomAdjuster.ApplyOOMScoreAdj(0, int(s.OOMScoreAdj)); err != nil {
+		klog.Warning(err)
+	}
+    // 初始化kubeDeps中runtimeService、runtimeImageService，如果是docker启动dockershim
+	err = kubelet.PreInitRuntimeService(&s.KubeletConfiguration,
+		kubeDeps, &s.ContainerRuntimeOptions,
+		s.ContainerRuntime,
+		s.RuntimeCgroups,
+		s.RemoteRuntimeEndpoint,
+		s.RemoteImageEndpoint,
+		s.NonMasqueradeCIDR)
+	if err != nil {
+		return err
+	}
+    // 执行下一步RunKubelet
+	if err := RunKubelet(s, kubeDeps, s.RunOnce); err != nil {
+		return err
+	}
+    // 启动healthz http server
+	if s.HealthzPort > 0 {
+		mux := http.NewServeMux()
+		healthz.InstallHandler(mux)
+		go wait.Until(func() {
+			err := http.ListenAndServe(net.JoinHostPort(s.HealthzBindAddress, strconv.Itoa(int(s.HealthzPort))), mux)
+			if err != nil {
+				klog.Errorf("Starting healthz server failed: %v", err)
+			}
+		}, 5*time.Second, wait.NeverStop)
+	}
+
+	if s.RunOnce {
+		return nil
+	}
+
+	// 通知systemd
+	go daemon.SdNotify(false, "READY=1")
+
+	select {
+	case <-done:
+		break
+	case <-ctx.Done():
+		break
+	}
+
+	return nil
+}
+```
+
+**run** 主要执行配置检查与初始化工作
+
+- KubeletServer参数验证
+- KubeDependencies中各种clientset初始化
+- ContainerManager创建初始化
+- 启动dockershim、创建runtimeService、runtimeImageService
+
+4   cmd/kubelet/app/server.go:1071
+
+```
+func RunKubelet(kubeServer *options.KubeletServer, kubeDeps *kubelet.Dependencies, runOnce bool) error {
+	hostname, err := nodeutil.GetHostname(kubeServer.HostnameOverride)
+	if err != nil {
+		return err
+	}
+	// Query the cloud provider for our node name, default to hostname if kubeDeps.Cloud == nil
+	nodeName, err := getNodeName(kubeDeps.Cloud, hostname)
+	if err != nil {
+		return err
+	}
+	hostnameOverridden := len(kubeServer.HostnameOverride) > 0
+	// Setup event recorder if required.
+	makeEventRecorder(kubeDeps, nodeName)
+    // 特权模式启动
+	capabilities.Initialize(capabilities.Capabilities{
+		AllowPrivileged: true,
+	})
+
+	credentialprovider.SetPreferredDockercfgPath(kubeServer.RootDirectory)
+	klog.V(2).Infof("Using root directory: %v", kubeServer.RootDirectory)
+
+	if kubeDeps.OSInterface == nil {
+		kubeDeps.OSInterface = kubecontainer.RealOS{}
+	}
+	// 创建初始化Kubelet结构体
+	k, err := createAndInitKubelet(&kubeServer.KubeletConfiguration,
+		......
+		kubeServer.NodeStatusMaxImages)
+	if err != nil {
+		return fmt.Errorf("failed to create kubelet: %v", err)
+	}
+
+	// NewMainKubelet should have set up a pod source config if one didn't exist
+	// when the builder was run. This is just a precaution.
+	if kubeDeps.PodConfig == nil {
+		return fmt.Errorf("failed to create kubelet, pod source config was nil")
+	}
+	podCfg := kubeDeps.PodConfig
+
+	if err := rlimit.SetNumFiles(uint64(kubeServer.MaxOpenFiles)); err != nil {
+		klog.Errorf("Failed to set rlimit on max file handles: %v", err)
+	}
+
+	// process pods and exit.
+	if runOnce {
+		if _, err := k.RunOnce(podCfg.Updates()); err != nil {
+			return fmt.Errorf("runonce failed: %v", err)
+		}
+		klog.Info("Started kubelet as runonce")
+	} else {
+	    // 调用startKubelet
+		startKubelet(k, podCfg, &kubeServer.KubeletConfiguration, kubeDeps, kubeServer.EnableCAdvisorJSONEndpoints, kubeServer.EnableServer)
+		klog.Info("Started kubelet")
+	}
+	return nil
+}
+```
+
+**RunKubelet** 创建Kubelet关键结构体，执行startKubelet，其最终通过goroutine进入Kubelet.Run
+
+5  cmd/kubelet/kubelet.go:333
+
+由于Kubelet结构体非常关键，先看下NewMainKubelet创建初始化Kubelet关键结构体函数
+
+```
+func createAndInitKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
+	......
+	nodeStatusMaxImages int32) (k kubelet.Bootstrap, err error) {
+	// 创建初始化Kubelet
+	k, err = kubelet.NewMainKubelet(kubeCfg,
+		......
+		nodeStatusMaxImages)
+	if err != nil {
+		return nil, err
+	}
+	// 向apiserver发送kubelet启动event
+	k.BirthCry()
+	// 启动垃圾回收container、images
+	k.StartGarbageCollection()
+	return k, nil
+}
+
 func NewMainKubelet(...){
+    ......
     // 创建PodConfig，watch apiserver、file、http等
 	if kubeDeps.PodConfig == nil {
 		var err error
@@ -54,19 +521,65 @@ func NewMainKubelet(...){
 			return nil, err
 		}
 	}
+	......
 	// 创建service informer、node、oom watcher
+    var serviceLister corelisters.ServiceLister
+	var serviceHasSynced cache.InformerSynced
+	if kubeDeps.KubeClient != nil {
+		kubeInformers := informers.NewSharedInformerFactory(kubeDeps.KubeClient, 0)
+		serviceLister = kubeInformers.Core().V1().Services().Lister()
+		serviceHasSynced = kubeInformers.Core().V1().Services().Informer().HasSynced
+		kubeInformers.Start(wait.NeverStop)
+	} else {
+		serviceIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+		serviceLister = corelisters.NewServiceLister(serviceIndexer)
+		serviceHasSynced = func() bool { return true }
+	}
+
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if kubeDeps.KubeClient != nil {
+		fieldSelector := fields.Set{api.ObjectNameField: string(nodeName)}.AsSelector()
+		nodeLW := cache.NewListWatchFromClient(kubeDeps.KubeClient.CoreV1().RESTClient(), "nodes", metav1.NamespaceAll, fieldSelector)
+		r := cache.NewReflector(nodeLW, &v1.Node{}, nodeIndexer, 0)
+		go r.Run(wait.NeverStop)
+	}
+	nodeLister := corelisters.NewNodeLister(nodeIndexer)
+
+	nodeRef := &v1.ObjectReference{
+		Kind:      "Node",
+		Name:      string(nodeName),
+		UID:       types.UID(nodeName),
+		Namespace: "",
+	}
+
+	oomWatcher, err := oomwatcher.NewWatcher(kubeDeps.Recorder)
+	if err != nil {
+		return nil, err
+	}
 	// 创建Kubelet
+	klet := &Kubelet{...}
 	// 创建各种manager例如secret、configMap
 	// 创建podManager，管理pod信息
 	klet.podManager = kubepod.NewBasicPodManager(mirrorPodClient, secretManager, configMapManager)
+	// 创建runtimeManager，其通过runtimeService、runtimeImageService实现对container的管理
+	runtime, err := kuberuntime.NewKubeGenericRuntimeManager(...)
 	// 创建pleg
 	klet.pleg = pleg.NewGenericPLEG(klet.containerRuntime, plegChannelCapacity, plegRelistPeriod, klet.podCache, clock.RealClock{})
+	// imageManager、probeManager、volumeManager、pluginManager等设置
+	//   初始化workQueue、podWorker
+	klet.reasonCache = NewReasonCache()
+	klet.workQueue = queue.NewBasicWorkQueue(klet.clock)
 	// 创建podWorker，syncPod为每个pod处理逻辑函数，在每个pod的goroutine中对pod更新进行同步
-	klet.podWorkers = newPodWorkers(klet.syncPod, kubeDeps.Recorder, klet.workQueue,   klet.resyncInterval, backOffPeriod, klet.podCache
+	klet.podWorkers = newPodWorkers(klet.syncPod, kubeDeps.Recorder, klet.workQueue, klet.resyncInterval, backOffPeriod, klet.podCache)
+	......
 }
+```
 
-// Kubelet Run方法
-pkg/kubelet/kubelet.go:1314
+**NewMainKubelet** 创建并初始化Kubelet结构体，其依赖各种Manager、podConfig、pleg、podWorkers的初始化
+
+6 pkg/kubelet/kubelet.go:1314   Kubelet.Run方法
+
+```
 func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
     // 初始化与runtime无关的逻辑，metrics、imageManager等
 	if err := kl.initializeModules(); err != nil {
@@ -109,7 +622,8 @@ func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
 	kl.syncLoop(updates, kl)
 }
 ```
-上述代码逻辑实现kubelet参数、配置、信号处理注册，初始化依赖、Kubelet启动Manager, 进入各自manager处理逻辑，最后进入kubelet主循环逻辑，主循环有5个事件源
+
+**Run** 实现kubelet参数、配置、信号处理注册，初始化依赖、Kubelet启动Manager, 进入各自manager处理逻辑，最后进入kubelet主循环逻辑，主循环有5个事件源
 
 - configCh                    podConfig处理来自apiserver、file、http的pod更新，在创建Kubelet时初始化
 - handler                      liveness manager处理，在创建Kubelet时初始化，为statusManager的一部分
@@ -117,9 +631,10 @@ func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
 - housekeepingCh         time定时清理pod
 - plegCh                      处理来自pleg的消息，在创建Kubelet时初始化，关于pleg可以看[这里](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/node/pod-lifecycle-event-generator.md)，简单说对容器状态感知由每个pod worker(goroutine)轮询改为pleg
 
+7  pkg/kubelet/kubelet.go:1814  kubelet事件循环函数
+
 ```
-// kubelet事件循环函数
-pkg/kubelet/kubelet.go:1814
+
 func (kl *Kubelet) syncLoopIteration(configCh <-chan kubetypes.PodUpdate, handler SyncHandler,
 	syncCh <-chan time.Time, housekeepingCh <-chan time.Time, plegCh <-chan *pleg.PodLifecycleEvent) bool {
 	select {
@@ -202,11 +717,15 @@ func (kl *Kubelet) syncLoopIteration(configCh <-chan kubetypes.PodUpdate, handle
 }
 ```
 
+** syncLoopIteration** 根据事件类型调用对应的handler进行处理
+
+8 pkg/kubelet/pod_workers.go:200
+
 对不同事件有不同的处理handler，大部分handler都会通过dispatchWork进入podWorkers.UpdatePod
 
 ```
 // podWorkers存储每个pod的goroutine并处理pod的update到对应goroutine
-pkg/kubelet/pod_workers.go:200
+
 func (p *podWorkers) UpdatePod(options *UpdatePodOptions) {
 	pod := options.Pod
 	uid := pod.UID
@@ -271,7 +790,9 @@ func (p *podWorkers) managePodLoop(podUpdates <-chan UpdatePodOptions) {
 }
 ```
 
-syncPod: 在交由runtime完成真正的处理逻辑之前，进行一些预处理
+9  pkg/kubelet/kubelet.go:1395
+
+syncPod: 在交由runtimeManager完成真正的处理逻辑之前，进行一些预处理
 
 ```
 func (kl *Kubelet) syncPod(o syncPodOptions) error {
@@ -439,7 +960,7 @@ func (kl *Kubelet) syncPod(o syncPodOptions) error {
 	// Fetch the pull secrets for the pod
 	pullSecrets := kl.getPullSecretsForPod(pod)
 
-	// 调用runtime处理pod
+	// 调用runtimeManager处理pod
 	result := kl.containerRuntime.SyncPod(pod, podStatus, pullSecrets, kl.backOff)
 	kl.reasonCache.Update(pod.UID, result)
 	if err := result.Error(); err != nil {
@@ -457,3 +978,9 @@ func (kl *Kubelet) syncPod(o syncPodOptions) error {
 }
 ```
 
+
+### 参考文档
+
+[微软资深工程师详解 K8S 容器运行时](https://juejin.cn/post/6844903694618607623)
+
+[深入k8s：kubelet创建pod流程源码分析](https://www.cnblogs.com/luozhiyun/p/13736569.html)
