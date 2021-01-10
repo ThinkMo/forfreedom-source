@@ -170,7 +170,7 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
 		kubeDeps.EventClient = nil
 		kubeDeps.HeartbeatClient = nil
 		klog.Warningf("standalone mode, no API client")
-    // 根据配置创建各个clientset
+	// 根据配置创建各个clientset
 	case kubeDeps.KubeClient == nil, kubeDeps.EventClient == nil, kubeDeps.HeartbeatClient == nil:
 		clientConfig, closeAllConns, err := buildKubeletClientConfig(ctx, s, nodeName)
 		if err != nil {
@@ -210,7 +210,7 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
 			return fmt.Errorf("failed to initialize kubelet heartbeat client: %v", err)
 		}
 	}
-    // 初始化auth
+	// 初始化auth
 	if kubeDeps.Auth == nil {
 		auth, runAuthenticatorCAReload, err := BuildAuth(nodeName, kubeDeps.KubeClient, s.KubeletConfiguration)
 		if err != nil {
@@ -219,7 +219,7 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
 		kubeDeps.Auth = auth
 		runAuthenticatorCAReload(ctx.Done())
 	}
-    // 设置cgroupRoot
+	// 设置cgroupRoot
 	var cgroupRoots []string
 	nodeAllocatableRoot := cm.NodeAllocatableRoot(s.CgroupRoot, s.CgroupsPerQOS, s.CgroupDriver)
 	cgroupRoots = append(cgroupRoots, nodeAllocatableRoot)
@@ -242,7 +242,7 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
 		// SystemCgroups is optional, so ignore if it isn't specified
 		cgroupRoots = append(cgroupRoots, s.SystemCgroups)
 	}
-    // 初始化cAdvisor
+	// 初始化cAdvisor
 	if kubeDeps.CAdvisorInterface == nil {
 		imageFsInfoProvider := cadvisor.NewImageFsInfoProvider(s.ContainerRuntime, s.RemoteRuntimeEndpoint)
 		kubeDeps.CAdvisorInterface, err = cadvisor.New(imageFsInfoProvider, s.RootDirectory, cgroupRoots, cadvisor.UsingLegacyCadvisorStats(s.ContainerRuntime, s.RemoteRuntimeEndpoint))
@@ -253,13 +253,13 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
 
 	// Setup event recorder if required.
 	makeEventRecorder(kubeDeps, nodeName)
-    // 初始化containerManager
+	// 初始化containerManager
 	if kubeDeps.ContainerManager == nil {
 		if s.CgroupsPerQOS && s.CgroupRoot == "" {
 			klog.Info("--cgroups-per-qos enabled, but --cgroup-root was not specified.  defaulting to /")
 			s.CgroupRoot = "/"
 		}
-       // 计算节点capacity
+		// 计算节点capacity
 		var reservedSystemCPUs cpuset.CPUSet
 		var errParse error
 		if s.ReservedSystemCPUs != "" {
@@ -323,7 +323,7 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
 		}
 
 		devicePluginEnabled := utilfeature.DefaultFeatureGate.Enabled(features.DevicePlugins)
-       // 创建ContainerManager，其中包含cgroupManager、QosContainerManager、cpuManager等
+		// 创建ContainerManager，其中包含cgroupManager、QosContainerManager、cpuManager等
 		kubeDeps.ContainerManager, err = cm.NewContainerManager(
 			kubeDeps.Mounter,
 			kubeDeps.CAdvisorInterface,
@@ -362,7 +362,7 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
 			return err
 		}
 	}
-    // 检查是否root启动
+	// 检查是否root启动
 	if err := checkPermissions(); err != nil {
 		klog.Error(err)
 	}
@@ -374,7 +374,7 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
 	if err := oomAdjuster.ApplyOOMScoreAdj(0, int(s.OOMScoreAdj)); err != nil {
 		klog.Warning(err)
 	}
-    // 初始化kubeDeps中runtimeService、runtimeImageService，如果是docker启动dockershim
+	// 初始化kubeDeps中runtimeService、runtimeImageService，如果是docker启动dockershim
 	err = kubelet.PreInitRuntimeService(&s.KubeletConfiguration,
 		kubeDeps, &s.ContainerRuntimeOptions,
 		s.ContainerRuntime,
@@ -385,11 +385,11 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
 	if err != nil {
 		return err
 	}
-    // 执行下一步RunKubelet
+	// 执行下一步RunKubelet
 	if err := RunKubelet(s, kubeDeps, s.RunOnce); err != nil {
 		return err
 	}
-    // 启动healthz http server
+	// 启动healthz http server
 	if s.HealthzPort > 0 {
 		mux := http.NewServeMux()
 		healthz.InstallHandler(mux)
@@ -442,7 +442,7 @@ func RunKubelet(kubeServer *options.KubeletServer, kubeDeps *kubelet.Dependencie
 	hostnameOverridden := len(kubeServer.HostnameOverride) > 0
 	// Setup event recorder if required.
 	makeEventRecorder(kubeDeps, nodeName)
-    // 特权模式启动
+	// 特权模式启动
 	capabilities.Initialize(capabilities.Capabilities{
 		AllowPrivileged: true,
 	})
@@ -479,7 +479,7 @@ func RunKubelet(kubeServer *options.KubeletServer, kubeDeps *kubelet.Dependencie
 		}
 		klog.Info("Started kubelet as runonce")
 	} else {
-	    // 调用startKubelet
+        // 调用startKubelet
 		startKubelet(k, podCfg, &kubeServer.KubeletConfiguration, kubeDeps, kubeServer.EnableCAdvisorJSONEndpoints, kubeServer.EnableServer)
 		klog.Info("Started kubelet")
 	}
@@ -512,8 +512,8 @@ func createAndInitKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 }
 
 func NewMainKubelet(...){
-    ......
-    // 创建PodConfig，watch apiserver、file、http等
+	......
+	// 创建PodConfig，watch apiserver、file、http等
 	if kubeDeps.PodConfig == nil {
 		var err error
 		kubeDeps.PodConfig, err = makePodSourceConfig(kubeCfg, kubeDeps, nodeName)
@@ -523,7 +523,7 @@ func NewMainKubelet(...){
 	}
 	......
 	// 创建service informer、node、oom watcher
-    var serviceLister corelisters.ServiceLister
+	var serviceLister corelisters.ServiceLister
 	var serviceHasSynced cache.InformerSynced
 	if kubeDeps.KubeClient != nil {
 		kubeInformers := informers.NewSharedInformerFactory(kubeDeps.KubeClient, 0)
@@ -581,7 +581,7 @@ func NewMainKubelet(...){
 
 ```
 func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
-    // 初始化与runtime无关的逻辑，metrics、imageManager等
+	// 初始化与runtime无关的逻辑，metrics、imageManager等
 	if err := kl.initializeModules(); err != nil {
 		kl.recorder.Eventf(kl.nodeRef, v1.EventTypeWarning, events.KubeletSetupFailed, err.Error())
 		klog.Fatal(err)
@@ -666,7 +666,7 @@ func (kl *Kubelet) syncLoopIteration(configCh <-chan kubetypes.PodUpdate, handle
 			klog.Errorf("Invalid event type received: %d.", u.Op)
 		}
 		kl.sourcesReady.AddSource(u.Source)
-    // 处理来自runtime的容器变化
+	// 处理来自runtime的容器变化
 	case e := <-plegCh:
 		if e.Type == pleg.ContainerStarted {
 			kl.lastContainerStartedTime.Add(e.ID, time.Now())
@@ -818,8 +818,8 @@ func (kl *Kubelet) syncPod(o syncPodOptions) error {
 		}
 		return nil
 	}
-    ....
-    // 是否能运行pod
+	....
+	// 是否能运行pod
 	runnable := kl.canRunPod(pod)
 	if !runnable.Admit {
 		//不能回写container等待原因
