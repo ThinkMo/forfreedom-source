@@ -717,7 +717,7 @@ func (kl *Kubelet) syncLoopIteration(configCh <-chan kubetypes.PodUpdate, handle
 }
 ```
 
-** syncLoopIteration** 根据事件类型调用对应的handler进行处理
+**syncLoopIteration** 根据事件类型调用对应的handler进行处理
 
 8 pkg/kubelet/pod_workers.go:200
 
