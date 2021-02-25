@@ -796,7 +796,7 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
                         sched.recordSchedulingFailure(prof, assumedPodInfo, preBindStatus.AsError(), SchedulerError, "")
                         return
                 }
-
+                // 执行bind extender/plugins，默认bind实现通过client更新pod
                 err := sched.bind(bindingCycleCtx, prof, assumedPod, scheduleResult.SuggestedHost, state)
                 if err != nil {
                         metrics.PodScheduleError(prof.Name, metrics.SinceInSeconds(start))
@@ -828,12 +828,12 @@ pkg/scheduler/core/generic_scheduler.go:138 调度算法进行调度
 func (g *genericScheduler) Schedule(ctx context.Context, prof *profile.Profile, state *framework.CycleState, pod *v1.Pod) (result ScheduleResult, err error) {
         trace := utiltrace.New("Scheduling", utiltrace.Field{Key: "namespace", Value: pod.Namespace}, utiltrace.Field{Key: "name", Value: pod.Name})
         defer trace.LogIfLong(100 * time.Millisecond)
-        // 检查pvc等
+        // 检查pvc是否已经ready
         if err := podPassesBasicChecks(pod, g.pvcLister); err != nil {
                 return result, err
         }
         trace.Step("Basic checks done")
-        // 1. 生成node snapshot(基于共享状态的调度，类似事务)
+        // 1. 更新node snapshot(基于共享状态的调度，类似事务); cache->snapshot
         if err := g.snapshot(); err != nil {
                 return result, err
         }
@@ -872,7 +872,7 @@ func (g *genericScheduler) Schedule(ctx context.Context, prof *profile.Profile, 
                         FeasibleNodes:  1,
                 }, nil
         }
-        // 3. 优选，priority pluagins、extenders
+        // 3. 优选，Score pluagins、extenders，结果为node名称、score的struct slice
         priorityList, err := g.prioritizeNodes(ctx, prof, state, pod, feasibleNodes)
         if err != nil {
                 return result, err
@@ -880,7 +880,7 @@ func (g *genericScheduler) Schedule(ctx context.Context, prof *profile.Profile, 
 
         metrics.DeprecatedSchedulingAlgorithmPriorityEvaluationSecondsDuration.Observe(metrics.SinceInSeconds(startPriorityEvalTime))
         metrics.DeprecatedSchedulingDuration.WithLabelValues(metrics.PriorityEvaluation).Observe(metrics.SinceInSeconds(startPriorityEvalTime))
-        // 4. 选择host
+        // 4. 选择score最大的host，score相同时会随机更新遍历的node节点
         host, err := g.selectHost(priorityList)
         trace.Step("Prioritizing done")
 
@@ -891,3 +891,106 @@ func (g *genericScheduler) Schedule(ctx context.Context, prof *profile.Profile, 
         }, err
 }
 ```
+
+scheduler默认inTree plugins在
+
+pkg/scheduler/alogrithmprovider/registry.go:78
+
+```
+func getDefaultConfig() *schedulerapi.Plugins {
+        return &schedulerapi.Plugins{
+                QueueSort: &schedulerapi.PluginSet{
+                        Enabled: []schedulerapi.Plugin{
+                                // 按优先级排序
+                                {Name: queuesort.Name},
+                        },
+                },
+                PreFilter: &schedulerapi.PluginSet{
+                        Enabled: []schedulerapi.Plugin{
+                                // node资源是否满足pod
+                                {Name: noderesources.FitName},
+                                // 端口冲突检查
+                                {Name: nodeports.Name},
+                                // 拓扑区域检查类似az
+                                {Name: podtopologyspread.Name},
+                                // pod亲和性
+                                {Name: interpodaffinity.Name},
+                                // 卷
+                                {Name: volumebinding.Name},
+                        },
+                },
+                Filter: &schedulerapi.PluginSet{
+                        Enabled: []schedulerapi.Plugin{
+                                {Name: nodeunschedulable.Name},
+                                {Name: noderesources.FitName},
+                                {Name: nodename.Name},
+                                {Name: nodeports.Name},
+                                // 节点亲和性
+                                {Name: nodeaffinity.Name},
+                                {Name: volumerestrictions.Name},
+                                {Name: tainttoleration.Name},
+                                {Name: nodevolumelimits.EBSName},
+                                {Name: nodevolumelimits.GCEPDName},
+                                {Name: nodevolumelimits.CSIName},
+                                {Name: nodevolumelimits.AzureDiskName},
+                                {Name: volumebinding.Name},
+                                {Name: volumezone.Name},
+                                // pod拓扑约束
+                                {Name: podtopologyspread.Name},
+                                {Name: interpodaffinity.Name},
+                        },
+                },
+                PostFilter: &schedulerapi.PluginSet{
+                        Enabled: []schedulerapi.Plugin{
+                                // 抢占
+                                {Name: defaultpreemption.Name},
+                        },
+                },
+                PreScore: &schedulerapi.PluginSet{
+                        Enabled: []schedulerapi.Plugin{
+                                {Name: interpodaffinity.Name},
+                                {Name: podtopologyspread.Name},
+                                {Name: tainttoleration.Name},
+                        },
+                },
+                Score: &schedulerapi.PluginSet{
+                        Enabled: []schedulerapi.Plugin{
+                                {Name: noderesources.BalancedAllocationName, Weight: 1},
+                                // 镜像本地
+                                {Name: imagelocality.Name, Weight: 1},
+                                {Name: interpodaffinity.Name, Weight: 1},
+                                {Name: noderesources.LeastAllocatedName, Weight: 1},
+                                {Name: nodeaffinity.Name, Weight: 1},
+                                {Name: nodepreferavoidpods.Name, Weight: 10000},
+                                // Weight is doubled because:
+                                // - This is a score coming from user preference.
+                                // - It makes its signal comparable to NodeResourcesLeastAllocated.
+                                {Name: podtopologyspread.Name, Weight: 2},
+                                {Name: tainttoleration.Name, Weight: 1},
+                        },
+                },
+                Reserve: &schedulerapi.PluginSet{
+                        Enabled: []schedulerapi.Plugin{
+                                {Name: volumebinding.Name},
+                        },
+                },
+                PreBind: &schedulerapi.PluginSet{
+                        Enabled: []schedulerapi.Plugin{
+                                {Name: volumebinding.Name},
+                        },
+                },
+                Bind: &schedulerapi.PluginSet{
+                        Enabled: []schedulerapi.Plugin{
+                                // 默认bind，client调用Bind
+                                {Name: defaultbinder.Name},
+                        },
+                },
+        }
+}
+```
+
+### 参考
+
+[Omega: flexible, scalable schedulers for large compute clusters](https://static.googleusercontent.com/media/research.google.com/zh-CN//pubs/archive/41684.pdf)(共享状态调度)
+
+[进击的Kubernetes调度系统（一）：Scheduling Framework](https://developer.aliyun.com/article/766273)
