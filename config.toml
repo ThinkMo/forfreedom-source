@@ -21,7 +21,7 @@ disqusShortname = "MTAyMC80ODIxMS8yNDcwNw=="
 googleAnalytics = "UA-82870469-1"
 paginate = 7
 canonifyurls = true
-publishDir = "/Users/xiao/forfreedom"
+publishDir = "public"
 
 [permalinks]
   post = "/:year/:month/:slug/"
