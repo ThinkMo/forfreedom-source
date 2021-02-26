@@ -21,6 +21,7 @@ disqusShortname = "MTAyMC80ODIxMS8yNDcwNw=="
 googleAnalytics = "UA-82870469-1"
 paginate = 7
 canonifyurls = true
+enableRobotsTXT = true
 publishDir = "public"
 
 [permalinks]
